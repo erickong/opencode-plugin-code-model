@@ -1,0 +1,49 @@
+{
+  "name": "opencode-plugin-code-model",
+  "version": "0.1.0",
+  "description": "Delegate code writing to a separate, cost-effective model in opencode",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "ai",
+    "llm",
+    "code-model",
+    "delegation",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "author": "erickong",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "src"
+  ],
+  "exports": {
+    "./server": {
+      "import": "./src/server.ts"
+    },
+    "./tui": {
+      "import": "./src/tui.tsx"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erickong/opencode-plugin-code-model.git"
+  },
+  "homepage": "https://github.com/erickong/opencode-plugin-code-model#readme",
+  "bugs": {
+    "url": "https://github.com/erickong/opencode-plugin-code-model/issues"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "@opentui/solid": "^0.4.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "opencode": "^1.0.0"
+  }
+}
