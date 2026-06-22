@@ -2,6 +2,71 @@ import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { readCodeModel, parseModelString, formatModel, type CodeModel } from "./shared.js"
 
+function clip(s: string, n: number): string {
+  return s.length <= n ? s : s.slice(0, n) + "…"
+}
+
+async function trackProgress(
+  client: any,
+  sessionID: string,
+  directory: string,
+  signal: AbortSignal,
+  modelLabel: string,
+  ctx: { metadata: (opts: { title: string }) => void },
+): Promise<void> {
+  try {
+    const sub = await client.event.subscribe({ query: { directory }, signal })
+
+    let todos: any[] = []
+    let toolCount = 0
+    let lastSnippet = ""
+    let lastTitleAt = 0
+
+    const emitTitle = (force = false) => {
+      const now = Date.now()
+      if (!force && now - lastTitleAt < 250) return
+      lastTitleAt = now
+
+      const completed = todos.filter((t: any) => t.status === "completed").length
+      const current = todos.find((t: any) => t.status === "in_progress")
+      let title = `Delegating to ${modelLabel}…`
+      if (todos.length > 0) {
+        title += ` ${completed}/${todos.length}`
+        if (current) title += ` · ${clip(current.content, 50)}`
+      } else {
+        if (toolCount > 0) title += ` ${toolCount} tools`
+        if (lastSnippet) title += ` · ${clip(lastSnippet, 40)}`
+      }
+      ctx.metadata({ title })
+    }
+
+    for await (const event of sub.stream) {
+      if (signal.aborted) break
+
+      const props = (event as any).properties ?? {}
+      const sid = props.sessionID ?? props.part?.sessionID
+      if (sid !== sessionID) continue
+
+      if (event.type === "todo.updated") {
+        todos = props.todos ?? []
+        emitTitle(true)
+      } else if (event.type === "message.part.updated") {
+        if (props.part?.type === "tool") {
+          toolCount++
+        }
+        if (props.part?.type === "text" || props.part?.type === "reasoning") {
+          lastSnippet = (props.delta ?? props.part?.text ?? "").replace(/\s+/g, " ").trim()
+          emitTitle()
+        }
+      } else if (event.type === "session.idle") {
+        break
+      }
+    }
+  } catch {
+    // aborted or stream ended — ignore, never throw
+  }
+}
+
 const server: Plugin = async (input) => {
   const directory = input.directory
   const subSessions = new Set<string>()
@@ -26,6 +91,7 @@ const server: Plugin = async (input) => {
           "2. Call delegate_code with a detailed task description (file paths, signatures, behavior).",
           "3. Review the returned result — read modified files to verify correctness.",
           "4. Run tests if applicable. If fixes are needed, call delegate_code again.",
+          "5. For complex tasks, include a concise step breakdown in the `task` so the code model has clear direction.",
           "",
           "You CAN still directly: read files, search code (grep/glob), run shell commands, and review work.",
         ].join("\n"),
@@ -117,6 +183,8 @@ const server: Plugin = async (input) => {
             "3. Implement the task — create, edit, or fix files as needed.",
             "4. Follow the codebase's existing style strictly.",
             "5. After implementing, provide a summary of every file changed and what was done.",
+          "6. For NON-TRIVIAL tasks, start by creating a todo list with the `todowrite` tool (break the work into concrete ordered steps), and keep it updated as you progress (mark each step completed, set the next in_progress). Skip the todo list for trivial one-step tasks — it's optional.",
+          "7. Your todo updates and tool calls stream live progress back to the caller, so keep working steadily.",
           )
 
           ctx.metadata({
@@ -138,6 +206,13 @@ const server: Plugin = async (input) => {
 
           const subSessionID = createResult.data.id
           subSessions.add(subSessionID)
+
+          const stopProgress = new AbortController()
+          const onParentAbort = () => stopProgress.abort()
+          ctx.abort.addEventListener("abort", onParentAbort)
+          const progress = trackProgress(
+            input.client, subSessionID, ctx.directory, stopProgress.signal, formatModel(codeModel), ctx,
+          )
 
           const onAbort = () => {
             void input.client.session.abort({
@@ -216,6 +291,9 @@ const server: Plugin = async (input) => {
             }
           } finally {
             ctx.abort.removeEventListener("abort", onAbort)
+            ctx.abort.removeEventListener("abort", onParentAbort)
+            stopProgress.abort()
+            void progress.catch(() => {})
           }
         },
       }),
