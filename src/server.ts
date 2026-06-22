@@ -16,6 +16,19 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
 }
 
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>
+    const done = () => {
+      clearTimeout(timer)
+      signal.removeEventListener("abort", done)
+      resolve()
+    }
+    timer = setTimeout(done, ms)
+    signal.addEventListener("abort", done, { once: true })
+  })
+}
+
 async function trackProgress(
   client: any,
   sessionID: string,
@@ -26,137 +39,202 @@ async function trackProgress(
 ): Promise<void> {
   let pendingTitleTimer: ReturnType<typeof setTimeout> | undefined
 
+  let todos: any[] = []
+  const tools = new Set<string>()
+  const assistantMessages = new Set<string>()
+  const partByteOffsets = new Map<string, number>()
+  let currentTool = ""
+  let lastSnippet = ""
+  let deltaBytes = 0
+  let observedBytes = 0
+  let streamChunks = 0
+  let lastTitleAt = 0
+
+  const visibleBytes = () => Math.max(deltaBytes, observedBytes)
+
+  const noteStream = (delta: unknown): boolean => {
+    if (typeof delta !== "string" || delta.length === 0) return false
+    deltaBytes += byteLength(delta)
+    streamChunks++
+    lastSnippet = delta.replace(/\s+/g, " ").trim()
+    emitTitle()
+    return true
+  }
+
+  const notePartSize = (part: any): boolean => {
+    if (!part || typeof part.id !== "string") return false
+
+    let text = ""
+    if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
+      text = part.text
+    } else if (part.type === "tool") {
+      if (typeof part.state?.raw === "string") text = part.state.raw
+      else if (typeof part.state?.output === "string") text = part.state.output
+      else if (typeof part.state?.error === "string") text = part.state.error
+    }
+    if (!text) return false
+
+    const currentBytes = byteLength(text)
+    const previousBytes = partByteOffsets.get(part.id) ?? 0
+    if (currentBytes <= previousBytes) return false
+
+    observedBytes += currentBytes - previousBytes
+    partByteOffsets.set(part.id, currentBytes)
+    streamChunks++
+    return true
+  }
+
+  const noteTool = (part: any) => {
+    if (!part || part.type !== "tool") return
+    const toolID = part.callID ?? part.id
+    if (toolID) tools.add(toolID)
+    const toolTitle = part.state?.title
+    currentTool = toolTitle ? `${part.tool}: ${toolTitle}` : part.tool
+  }
+
+  const emitTitle = (force = false) => {
+    const now = Date.now()
+    const wait = 250 - (now - lastTitleAt)
+    if (!force && wait > 0) {
+      if (!pendingTitleTimer) {
+        pendingTitleTimer = setTimeout(() => {
+          pendingTitleTimer = undefined
+          emitTitle(true)
+        }, wait)
+      }
+      return
+    }
+
+    if (pendingTitleTimer) {
+      clearTimeout(pendingTitleTimer)
+      pendingTitleTimer = undefined
+    }
+    lastTitleAt = now
+
+    const bytes = visibleBytes()
+    const completed = todos.filter((t: any) => t.status === "completed").length
+    const current = todos.find((t: any) => t.status === "in_progress")
+    let title = `Delegating to ${modelLabel}...`
+    if (todos.length > 0) {
+      title += ` ${completed}/${todos.length}`
+      if (bytes > 0) title += ` - ${formatBytes(bytes)} streamed`
+      if (current) title += ` - ${clip(current.content, 50)}`
+    } else {
+      if (tools.size > 0) title += ` ${tools.size} tools`
+      if (bytes > 0) title += ` - ${formatBytes(bytes)} streamed`
+      else if (streamChunks > 0) title += " - streaming"
+      else title += " - waiting for output"
+      if (currentTool) title += ` - ${clip(currentTool, 50)}`
+      else if (lastSnippet) title += ` - ${clip(lastSnippet, 40)}`
+    }
+    ctx.metadata({ title })
+  }
+
+  const refreshFromSession = async () => {
+    const [messagesResult, todosResult] = await Promise.allSettled([
+      client.session.messages({ path: { id: sessionID }, query: { directory } }),
+      client.session.todo({ path: { id: sessionID }, query: { directory } }),
+    ])
+
+    if (messagesResult.status === "fulfilled" && !messagesResult.value.error) {
+      for (const message of messagesResult.value.data ?? []) {
+        const messageID = message.info?.id
+        const isAssistant = message.info?.role === "assistant"
+        if (isAssistant && typeof messageID === "string") assistantMessages.add(messageID)
+        if (!isAssistant) continue
+
+        for (const part of message.parts ?? []) {
+          const grew = notePartSize(part)
+          if (part.type === "tool") noteTool(part)
+          if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
+            const snippet = part.text.replace(/\s+/g, " ").trim()
+            if (snippet) lastSnippet = snippet.slice(-80)
+          }
+          if (grew) emitTitle()
+        }
+      }
+    }
+
+    if (todosResult.status === "fulfilled" && !todosResult.value.error) {
+      todos = todosResult.value.data ?? []
+    }
+
+    emitTitle(true)
+  }
+
+  const watchEvents = async () => {
+    try {
+      const sub = await client.event.subscribe({ query: { directory }, signal })
+      for await (const event of sub.stream) {
+        if (signal.aborted) break
+
+        const props = (event as any).properties ?? {}
+        const sid = props.sessionID ?? props.part?.sessionID
+        if (sid !== sessionID) continue
+
+        if (event.type === "message.updated") {
+          const message = props.info
+          if (message?.role === "assistant" && typeof message.id === "string") assistantMessages.add(message.id)
+        } else if (event.type === "todo.updated") {
+          todos = props.todos ?? []
+          emitTitle(true)
+        } else if (event.type === "message.part.updated") {
+          const part = props.part
+          const isAssistant = part?.type === "tool" || assistantMessages.has(part?.messageID)
+          if (isAssistant) {
+            if (!noteStream(props.delta)) notePartSize(part)
+            noteTool(part)
+
+            if (part?.type === "text" || part?.type === "reasoning") {
+              lastSnippet = (props.delta ?? part?.text ?? "").replace(/\s+/g, " ").trim()
+            }
+            emitTitle()
+          }
+        } else if (event.type === "message.part.delta") {
+          noteStream(props.delta)
+        } else if (
+          event.type === "session.next.text.delta" ||
+          event.type === "session.next.reasoning.delta" ||
+          event.type === "session.next.tool.input.delta"
+        ) {
+          noteStream(props.delta)
+        } else if (event.type === "session.next.tool.called") {
+          const callID = props.callID
+          if (callID) tools.add(callID)
+          currentTool = typeof props.tool === "string" ? props.tool : "tool"
+          emitTitle()
+        } else if (event.type === "session.next.tool.progress") {
+          const callID = props.callID
+          if (callID) tools.add(callID)
+          const text = Array.isArray(props.content)
+            ? props.content
+                .map((item: any) => (typeof item?.text === "string" ? item.text : ""))
+                .filter(Boolean)
+                .join(" ")
+            : ""
+          currentTool = text ? `tool: ${text}` : "tool progress"
+          emitTitle()
+        } else if (event.type === "session.status" && props.status?.type === "idle") {
+          break
+        } else if (event.type === "session.idle") {
+          break
+        }
+      }
+    } catch (error) {
+      if (!signal.aborted && process.env.OPENCODE_CODE_MODEL_DEBUG) {
+        console.warn("[code-model] Progress stream unavailable; using polling fallback", error)
+      }
+    }
+  }
+
   try {
-    const sub = await client.event.subscribe({ query: { directory }, signal })
+    emitTitle(true)
+    void watchEvents()
 
-    let todos: any[] = []
-    const tools = new Set<string>()
-    const partByteOffsets = new Map<string, number>()
-    let currentTool = ""
-    let lastSnippet = ""
-    let streamedBytes = 0
-    let streamChunks = 0
-    let lastTitleAt = 0
-
-    const noteStream = (delta: unknown): boolean => {
-      if (typeof delta !== "string" || delta.length === 0) return false
-      streamedBytes += byteLength(delta)
-      streamChunks++
-      lastSnippet = delta.replace(/\s+/g, " ").trim()
-      emitTitle()
-      return true
+    while (!signal.aborted) {
+      await refreshFromSession()
+      await sleep(1200, signal)
     }
-
-    const notePartGrowth = (part: any) => {
-      if (!part || typeof part.id !== "string") return
-
-      let text = ""
-      if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
-        text = part.text
-      } else if (part.type === "tool" && typeof part.state?.raw === "string") {
-        text = part.state.raw
-      }
-      if (!text) return
-
-      const currentBytes = byteLength(text)
-      const previousBytes = partByteOffsets.get(part.id) ?? 0
-      if (currentBytes > previousBytes) {
-        streamedBytes += currentBytes - previousBytes
-        streamChunks++
-        partByteOffsets.set(part.id, currentBytes)
-      }
-    }
-
-    const emitTitle = (force = false) => {
-      const now = Date.now()
-      const wait = 250 - (now - lastTitleAt)
-      if (!force && wait > 0) {
-        if (!pendingTitleTimer) {
-          pendingTitleTimer = setTimeout(() => {
-            pendingTitleTimer = undefined
-            emitTitle(true)
-          }, wait)
-        }
-        return
-      }
-
-      if (pendingTitleTimer) {
-        clearTimeout(pendingTitleTimer)
-        pendingTitleTimer = undefined
-      }
-      lastTitleAt = now
-
-      const completed = todos.filter((t: any) => t.status === "completed").length
-      const current = todos.find((t: any) => t.status === "in_progress")
-      let title = `Delegating to ${modelLabel}…`
-      if (todos.length > 0) {
-        title += ` ${completed}/${todos.length}`
-        if (streamedBytes > 0) title += ` · ${formatBytes(streamedBytes)} streamed`
-        if (current) title += ` · ${clip(current.content, 50)}`
-      } else {
-        if (tools.size > 0) title += ` ${tools.size} tools`
-        if (streamedBytes > 0) title += ` · ${formatBytes(streamedBytes)} streamed`
-        else if (streamChunks > 0) title += ` · streaming`
-        if (currentTool) title += ` · ${clip(currentTool, 50)}`
-        else if (lastSnippet) title += ` · ${clip(lastSnippet, 40)}`
-      }
-      ctx.metadata({ title })
-    }
-
-    for await (const event of sub.stream) {
-      if (signal.aborted) break
-
-      const props = (event as any).properties ?? {}
-      const sid = props.sessionID ?? props.part?.sessionID
-      if (sid !== sessionID) continue
-
-      if (event.type === "todo.updated") {
-        todos = props.todos ?? []
-        emitTitle(true)
-      } else if (event.type === "message.part.updated") {
-        if (!noteStream(props.delta)) notePartGrowth(props.part)
-
-        if (props.part?.type === "tool") {
-          const toolID = props.part.callID ?? props.part.id
-          if (toolID) tools.add(toolID)
-          const toolTitle = props.part.state?.title
-          currentTool = toolTitle ? `${props.part.tool}: ${toolTitle}` : props.part.tool
-          emitTitle()
-        }
-        if (props.part?.type === "text" || props.part?.type === "reasoning") {
-          lastSnippet = (props.delta ?? props.part?.text ?? "").replace(/\s+/g, " ").trim()
-          emitTitle()
-        }
-      } else if (event.type === "message.part.delta") {
-        noteStream(props.delta)
-      } else if (
-        event.type === "session.next.text.delta" ||
-        event.type === "session.next.reasoning.delta" ||
-        event.type === "session.next.tool.input.delta"
-      ) {
-        noteStream(props.delta)
-      } else if (event.type === "session.next.tool.called") {
-        const callID = props.callID
-        if (callID) tools.add(callID)
-        currentTool = typeof props.tool === "string" ? props.tool : "tool"
-        emitTitle()
-      } else if (event.type === "session.next.tool.progress") {
-        const callID = props.callID
-        if (callID) tools.add(callID)
-        const text = Array.isArray(props.content)
-          ? props.content
-              .map((item: any) => (typeof item?.text === "string" ? item.text : ""))
-              .filter(Boolean)
-              .join(" ")
-          : ""
-        currentTool = text ? `tool: ${text}` : "tool progress"
-        emitTitle()
-      } else if (event.type === "session.idle") {
-        break
-      }
-    }
-  } catch (error) {
-    if (!signal.aborted) console.warn("[code-model] Progress stream stopped", error)
   } finally {
     if (pendingTitleTimer) clearTimeout(pendingTitleTimer)
   }
@@ -294,7 +372,7 @@ const server: Plugin = async (input) => {
           )
 
           ctx.metadata({
-            title: `Delegating to ${formatModel(codeModel)}…`,
+            title: `Delegating to ${formatModel(codeModel)}... - starting`,
             metadata: { codeModel },
           })
 

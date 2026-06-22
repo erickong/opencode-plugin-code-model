@@ -1,6 +1,6 @@
 {
   "name": "opencode-plugin-code-model",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Delegate code writing to a separate, cost-effective model in opencode",
   "keywords": [
     "opencode",

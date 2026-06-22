@@ -81,6 +81,18 @@ function activeDelegationTitle(api: TuiPluginApi, sessionID: string): string {
   return ""
 }
 
+function compactProgress(title: string): string {
+  const todo = title.match(/\b\d+\/\d+\b/)?.[0]
+  const bytes = title.match(/\b\d+(?:\.\d+)?\s(?:B|KB|MB)\b/)?.[0]
+  const tools = title.match(/\b\d+ tools\b/)?.[0]
+  const parts = [todo, bytes, tools].filter(Boolean)
+
+  if (parts.length > 0) return parts.join(" ")
+  if (title.includes("streaming")) return "streaming"
+  if (title.includes("waiting for output")) return "waiting"
+  return "working"
+}
+
 function CodeProgress(props: { api: TuiPluginApi; sessionID: string }) {
   const title = () => activeDelegationTitle(props.api, props.sessionID)
   const activity = useActivity(() => Boolean(title()))
@@ -88,7 +100,9 @@ function CodeProgress(props: { api: TuiPluginApi; sessionID: string }) {
 
   return (
     <text flexShrink={0} fg={theme().accent}>
-      {title() ? `${SPINNER[activity.tick() % SPINNER.length]} ${formatElapsed(activity.elapsed())}` : ""}
+      {title()
+        ? `${SPINNER[activity.tick() % SPINNER.length]} ${formatElapsed(activity.elapsed())} ${compactProgress(title())}`
+        : ""}
     </text>
   )
 }
