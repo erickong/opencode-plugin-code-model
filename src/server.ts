@@ -6,6 +6,16 @@ function clip(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n) + "…"
 }
 
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 async function trackProgress(
   client: any,
   sessionID: string,
@@ -14,17 +24,66 @@ async function trackProgress(
   modelLabel: string,
   ctx: { metadata: (opts: { title: string }) => void },
 ): Promise<void> {
+  let pendingTitleTimer: ReturnType<typeof setTimeout> | undefined
+
   try {
     const sub = await client.event.subscribe({ query: { directory }, signal })
 
     let todos: any[] = []
-    let toolCount = 0
+    const tools = new Set<string>()
+    const partByteOffsets = new Map<string, number>()
+    let currentTool = ""
     let lastSnippet = ""
+    let streamedBytes = 0
+    let streamChunks = 0
     let lastTitleAt = 0
+
+    const noteStream = (delta: unknown): boolean => {
+      if (typeof delta !== "string" || delta.length === 0) return false
+      streamedBytes += byteLength(delta)
+      streamChunks++
+      lastSnippet = delta.replace(/\s+/g, " ").trim()
+      emitTitle()
+      return true
+    }
+
+    const notePartGrowth = (part: any) => {
+      if (!part || typeof part.id !== "string") return
+
+      let text = ""
+      if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
+        text = part.text
+      } else if (part.type === "tool" && typeof part.state?.raw === "string") {
+        text = part.state.raw
+      }
+      if (!text) return
+
+      const currentBytes = byteLength(text)
+      const previousBytes = partByteOffsets.get(part.id) ?? 0
+      if (currentBytes > previousBytes) {
+        streamedBytes += currentBytes - previousBytes
+        streamChunks++
+        partByteOffsets.set(part.id, currentBytes)
+      }
+    }
 
     const emitTitle = (force = false) => {
       const now = Date.now()
-      if (!force && now - lastTitleAt < 250) return
+      const wait = 250 - (now - lastTitleAt)
+      if (!force && wait > 0) {
+        if (!pendingTitleTimer) {
+          pendingTitleTimer = setTimeout(() => {
+            pendingTitleTimer = undefined
+            emitTitle(true)
+          }, wait)
+        }
+        return
+      }
+
+      if (pendingTitleTimer) {
+        clearTimeout(pendingTitleTimer)
+        pendingTitleTimer = undefined
+      }
       lastTitleAt = now
 
       const completed = todos.filter((t: any) => t.status === "completed").length
@@ -32,10 +91,14 @@ async function trackProgress(
       let title = `Delegating to ${modelLabel}…`
       if (todos.length > 0) {
         title += ` ${completed}/${todos.length}`
+        if (streamedBytes > 0) title += ` · ${formatBytes(streamedBytes)} streamed`
         if (current) title += ` · ${clip(current.content, 50)}`
       } else {
-        if (toolCount > 0) title += ` ${toolCount} tools`
-        if (lastSnippet) title += ` · ${clip(lastSnippet, 40)}`
+        if (tools.size > 0) title += ` ${tools.size} tools`
+        if (streamedBytes > 0) title += ` · ${formatBytes(streamedBytes)} streamed`
+        else if (streamChunks > 0) title += ` · streaming`
+        if (currentTool) title += ` · ${clip(currentTool, 50)}`
+        else if (lastSnippet) title += ` · ${clip(lastSnippet, 40)}`
       }
       ctx.metadata({ title })
     }
@@ -51,19 +114,51 @@ async function trackProgress(
         todos = props.todos ?? []
         emitTitle(true)
       } else if (event.type === "message.part.updated") {
+        if (!noteStream(props.delta)) notePartGrowth(props.part)
+
         if (props.part?.type === "tool") {
-          toolCount++
+          const toolID = props.part.callID ?? props.part.id
+          if (toolID) tools.add(toolID)
+          const toolTitle = props.part.state?.title
+          currentTool = toolTitle ? `${props.part.tool}: ${toolTitle}` : props.part.tool
+          emitTitle()
         }
         if (props.part?.type === "text" || props.part?.type === "reasoning") {
           lastSnippet = (props.delta ?? props.part?.text ?? "").replace(/\s+/g, " ").trim()
           emitTitle()
         }
+      } else if (event.type === "message.part.delta") {
+        noteStream(props.delta)
+      } else if (
+        event.type === "session.next.text.delta" ||
+        event.type === "session.next.reasoning.delta" ||
+        event.type === "session.next.tool.input.delta"
+      ) {
+        noteStream(props.delta)
+      } else if (event.type === "session.next.tool.called") {
+        const callID = props.callID
+        if (callID) tools.add(callID)
+        currentTool = typeof props.tool === "string" ? props.tool : "tool"
+        emitTitle()
+      } else if (event.type === "session.next.tool.progress") {
+        const callID = props.callID
+        if (callID) tools.add(callID)
+        const text = Array.isArray(props.content)
+          ? props.content
+              .map((item: any) => (typeof item?.text === "string" ? item.text : ""))
+              .filter(Boolean)
+              .join(" ")
+          : ""
+        currentTool = text ? `tool: ${text}` : "tool progress"
+        emitTitle()
       } else if (event.type === "session.idle") {
         break
       }
     }
-  } catch {
-    // aborted or stream ended — ignore, never throw
+  } catch (error) {
+    if (!signal.aborted) console.warn("[code-model] Progress stream stopped", error)
+  } finally {
+    if (pendingTitleTimer) clearTimeout(pendingTitleTimer)
   }
 }
 
@@ -80,20 +175,30 @@ const server: Plugin = async (input) => {
 
       output.system.push(
         [
-          "## Code Delegation Active",
+          "## Code Delegation Available",
           "",
           `A code model (${formatModel(codeModel)}) is configured to handle code implementation.`,
-          "When you need to WRITE, EDIT, CREATE, or FIX code, you MUST use the delegate_code tool.",
-          "Do NOT use write, edit, multi_edit, or str_replace tools directly.",
+          "Use the delegate_code tool for substantive, risky, or time-consuming implementation work.",
+          "For tiny, obvious edits, write code directly with the normal edit tools instead of delegating.",
           "",
-          "Process for code tasks:",
+          "Delegate when one or more apply:",
+          "- The expected diff is larger than about 1 KB, touches multiple files, or needs broad codebase exploration.",
+          "- The task involves architecture, API contracts, migrations, tests, generated assets, or non-obvious edge cases.",
+          "- You are uncertain about the right implementation and would benefit from a separate coding pass.",
+          "",
+          "Do NOT delegate when all apply:",
+          "- The change is a small/local edit, roughly 1 KB of final diff or less.",
+          "- It touches one obvious file or a very small number of nearby lines.",
+          "- The behavior is clear and low-risk, such as renaming text, fixing a typo, adjusting a constant, or adding a tiny guard.",
+          "",
+          "Process for delegated code tasks:",
           "1. Read relevant files and analyze the codebase.",
           "2. Call delegate_code with a detailed task description (file paths, signatures, behavior).",
-          "3. Review the returned result — read modified files to verify correctness.",
+          "3. Review the returned result - read modified files to verify correctness.",
           "4. Run tests if applicable. If fixes are needed, call delegate_code again.",
           "5. For complex tasks, include a concise step breakdown in the `task` so the code model has clear direction.",
           "",
-          "You CAN still directly: read files, search code (grep/glob), run shell commands, and review work.",
+          "You can always directly read files, search code, run shell commands, review work, and make small edits.",
         ].join("\n"),
       )
     },
@@ -101,9 +206,10 @@ const server: Plugin = async (input) => {
     tool: {
       delegate_code: tool({
         description: [
-          "Delegate a code-writing task to a separate code model for implementation.",
+          "Delegate a substantive code-writing task to a separate code model for implementation.",
           "The code model has full project access (file editing, shell, search) and will implement the task.",
           "Requires a code model to be configured via /code_model, or pass model='provider/modelID'.",
+          "Do not use this for tiny, obvious edits that are faster to make directly.",
           "",
           "Provide a detailed 'task' with:",
           "- Exact file paths to create or modify",

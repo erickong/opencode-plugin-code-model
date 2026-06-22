@@ -47,9 +47,9 @@ Run `/code_model` (alias `/cm`) in the TUI and pick a model — the same list as
 
 The selection is stored in `.opencode/code-model.json` in your project directory.
 
-### 2. The main model delegates code writing
+### 2. The main model delegates substantive code writing
 
-When the main model needs to write code, it calls the `delegate_code` tool with:
+When the main model needs non-trivial code implementation, it calls the `delegate_code` tool with:
 
 | Parameter  | Type   | Required | Description |
 |------------|--------|----------|-------------|
@@ -57,7 +57,11 @@ When the main model needs to write code, it calls the `delegate_code` tool with:
 | `context`  | string | No       | Additional context: code snippets, patterns, architecture notes |
 | `model`    | string | No       | Override model for this task: `"providerID/modelID"` |
 
+The main model can still make tiny, obvious edits directly. As a rule of thumb, changes around 1 KB of final diff or less, touching one obvious file with low risk, should usually be done directly instead of delegated. Larger, multi-file, risky, exploratory, or test-heavy changes should be delegated.
+
 The code model runs in a sub-session with full project access (file editing, shell, etc.). After completion, the main model receives a summary and reviews the changes.
+
+While delegation is running, the TUI shows an animated activity bar, elapsed time, streamed output bytes, and current code-model progress in the bottom status area. For non-trivial tasks this includes todo completion (for example `2/4`) and the active step; otherwise it shows the latest tool activity.
 
 ### Example workflow
 
