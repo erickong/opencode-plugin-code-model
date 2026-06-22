@@ -13,6 +13,12 @@ The main (expensive) model thinks, plans, and reviews. When code needs to be wri
 
 ## Install
 
+### Via npm
+
+```sh
+npm install -g opencode-plugin-code-model@latest
+```
+
 ### Via TUI plugin manager
 
 ```
